@@ -39,3 +39,20 @@ O ecossistema divide-se em motores de infraestrutura em segundo plano e uma inte
 Para evitar que softwares maliciosos ou ataques cibernéticos comprometam a integridade do sistema de defesa, os ficheiros vitais do SOC encontram-se rigorosamente trancados com o comando de imutabilidade do kernel Linux:
 ```bash
 sudo chattr +i app.py edr_shadow_ai.sh threat_intel.sh backup_imutavel.sh alerta_soc.sh
+
+## 🚀 Como Executar o Painel Local
+
+    Ative o ambiente virtual Python:
+    Bash
+
+    source venv/bin/activate
+
+    Inicie a aplicação Streamlit:
+    Bash
+
+    streamlit run app.py
+
+    Aceda no navegador através de: http://127.0.0.1:8501
+
+
+    
