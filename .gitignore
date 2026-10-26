@@ -6,3 +6,5 @@ app.py.save
 app_estavel.py
 backup/
 nohup.out
+backups/
+ips_alertados.txt

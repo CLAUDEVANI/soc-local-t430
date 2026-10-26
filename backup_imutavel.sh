@@ -19,3 +19,25 @@ sudo tar -czf "$ARQUIVO_FINAL" --exclude="$SOC_DIR/venv" "$SOC_DIR" /var/log/sur
 sudo chattr +i "$ARQUIVO_FINAL"
 
 echo "✅ Backup forense concluído e selado com imutabilidade em: $ARQUIVO_FINAL"
+
+#!/bin/bash
+DATA=$(date +%Y-%m-%d_%H-%M-%S)
+PASTA_DESTINO="/home/pereira/soc_local/backups"
+NOME_BACKUP="$PASTA_DESTINO/soc_backup_$DATA.tar.gz"
+
+echo "1. A preparar o cofre de backups em $PASTA_DESTINO..."
+mkdir -p $PASTA_DESTINO
+
+echo "2. A compactar código-fonte e logs dos sensores..."
+tar -czf $NOME_BACKUP \
+    /home/pereira/soc_local/app.py \
+    /home/pereira/soc_local/*.sh \
+    /home/pereira/soc_local/README.md \
+    /var/log/suricata/fast.log \
+    /var/log/nginx/access.log \
+    /var/log/fail2ban.log 2>/dev/null
+
+echo "3. A aplicar blindagem Anti-Ransomware (chattr +i)..."
+chattr +i $NOME_BACKUP
+
+echo "✅ Backup concluído e selado com sucesso: $NOME_BACKUP"

@@ -60,7 +60,8 @@ def ler_log_suricata():
     log_path = "/var/log/suricata/fast.log"
     
     ips_ignorados = ["192.168.15.3", "192.168.15.7"] 
-    prefixos_ignorados = ["2001:4860:", "2804:07f0:"] 
+    # Filtro da Fastly/GitHub adicionado
+    prefixos_ignorados = ["2001:4860:", "2804:07f0:", "151.101."] 
 
     if os.path.exists(log_path):
         try:
@@ -102,14 +103,41 @@ def ler_dados_fail2ban():
         ips = banned_ips.group(1).split() if banned_ips and banned_ips.group(1).strip() else []
         
         dados_f2b = []
+        novos_bloqueios = []
+        
+        # Motor de Memória: Verifica se o IP já foi notificado antes
+        ficheiro_memoria = "/home/pereira/soc_local/ips_alertados.txt"
+        ips_ja_alertados = set()
+        if os.path.exists(ficheiro_memoria):
+            with open(ficheiro_memoria, "r") as f:
+                ips_ja_alertados = set(f.read().splitlines())
+
         for ip in ips:
+            loc = obter_localizacao(ip)
             dados_f2b.append({
                 "Origem (IP)": ip,
-                "Localização": obter_localizacao(ip),
+                "Localização": loc,
                 "Estado": "🔒 Bloqueado",
                 "Prisão": "suricata"
             })
             
+            # Regra de Gatilho: Prepara o alerta se for um alvo inédito
+            if ip not in ips_ja_alertados:
+                novos_bloqueios.append((ip, loc))
+                ips_ja_alertados.add(ip)
+        
+        # Grava os novos IPs na memória e dispara os alertas no Telegram
+        if novos_bloqueios:
+            try:
+                with open(ficheiro_memoria, "w") as f:
+                    f.write("\n".join(ips_ja_alertados))
+                
+                for nip, nloc in novos_bloqueios:
+                    mensagem = f"🛡️ *SOC T430: NOVO BLOQUEIO*\n\n*IP Hostil:* `{nip}`\n*Local:* {nloc}\n*Ação:* Neutralizado pelo Firewall (Fail2Ban)."
+                    enviar_alerta_telegram(mensagem)
+            except Exception:
+                pass
+
         return total, pd.DataFrame(dados_f2b) if dados_f2b else pd.DataFrame(columns=["Origem (IP)", "Localização", "Estado", "Prisão"])
     except Exception:
         return "0", pd.DataFrame(columns=["Origem (IP)", "Localização", "Estado", "Prisão"])
@@ -213,7 +241,7 @@ with aba_nginx:
     st.dataframe(df_nginx, width="stretch", hide_index=True)
 
 with aba_saude:
-    st.info("Sensores operacionais. Motor de Threat Intelligence e Backups Imutáveis a aguardar implementação.")
+    st.info("Sensores operacionais. Motor de Threat Intelligence e Backups Imutáveis automatizados.")
 
 # ==========================================
 # EDR SHADOW AI
