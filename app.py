@@ -7,6 +7,7 @@ import time
 import os
 import geoip2.database
 import re
+import requests
 
 # ==========================================
 # CONFIGURAÇÕES DA PÁGINA
@@ -14,8 +15,26 @@ import re
 st.set_page_config(page_title="SOC Local - T430", layout="wide")
 
 # ==========================================
+# CREDENCIAIS DO TELEGRAM BOT
+# ==========================================
+TELEGRAM_TOKEN = "8530780213:AAHozocF9vzyhLT9mq0aS3Fv-2QSSnigfk0"
+TELEGRAM_CHAT_ID = "588759475"
+
+# ==========================================
 # FUNÇÕES DE LÓGICA E LEITURA
 # ==========================================
+def enviar_alerta_telegram(mensagem):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mensagem,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, data=payload, timeout=5)
+    except Exception:
+        pass
+
 def obter_localizacao(ip):
     if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("127.") or ip == "::1":
         return "Rede Local"
@@ -40,7 +59,6 @@ def ler_log_suricata():
     dados = []
     log_path = "/var/log/suricata/fast.log"
     
-    # Whitelist passiva: IPs a ocultar do painel visual (não desativa a firewall)
     ips_ignorados = ["192.168.15.3", "192.168.15.7"] 
     prefixos_ignorados = ["2001:4860:", "2804:07f0:"] 
 
@@ -54,7 +72,6 @@ def ler_log_suricata():
                     parte_origem = linha.split('->')[0].split()[-1]
                     origem = re.sub(r':\d+$', '', parte_origem).replace('[', '').replace(']', '')
                     
-                    # Motor do Filtro Visual: Ignora se estiver na lista exata ou tiver prefixo conhecido
                     if origem in ips_ignorados or any(origem.startswith(prefixo) for prefixo in prefixos_ignorados):
                         continue
                         
@@ -74,12 +91,10 @@ def ler_log_suricata():
 
 @st.cache_data(ttl=5)
 def ler_dados_fail2ban():
-    # Lê as prisões reais do Fail2Ban
     try:
         resultado = subprocess.run(['sudo', 'fail2ban-client', 'status', 'suricata'], stdout=subprocess.PIPE, text=True)
         texto = resultado.stdout
         
-        # Lê os "Currently banned" (Atualmente Presos)
         atualmente_banidos = re.search(r'Currently banned:\s+(\d+)', texto)
         banned_ips = re.search(r'Banned IP list:\s+(.*)', texto)
         
@@ -101,7 +116,6 @@ def ler_dados_fail2ban():
 
 @st.cache_data(ttl=5)
 def ler_log_nginx():
-    # Lê as tentativas de acesso web (WAF)
     dados = []
     log_path = "/var/log/nginx/access.log"
     if os.path.exists(log_path):
@@ -185,18 +199,18 @@ aba_suricata, aba_fail2ban, aba_nginx, aba_saude = st.tabs([
 ])
 
 with aba_suricata:
-    st.dataframe(df_suricata, use_container_width=True, hide_index=True)
+    st.dataframe(df_suricata, width="stretch", hide_index=True)
 
 with aba_fail2ban:
     if not df_fail2ban.empty:
         st.error(f"⚠️ {total_bloqueados} IP(s) hostis neutralizados e bloqueados pelo Firewall.")
-        st.dataframe(df_fail2ban, use_container_width=True, hide_index=True)
+        st.dataframe(df_fail2ban, width="stretch", hide_index=True)
     else:
         st.success("Nenhuma atividade maliciosa bloqueada. A prisão está vazia.")
 
 with aba_nginx:
     st.caption("Registo das últimas tentativas de acesso ao seu servidor Web local.")
-    st.dataframe(df_nginx, use_container_width=True, hide_index=True)
+    st.dataframe(df_nginx, width="stretch", hide_index=True)
 
 with aba_saude:
     st.info("Sensores operacionais. Motor de Threat Intelligence e Backups Imutáveis a aguardar implementação.")
