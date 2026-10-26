@@ -24,7 +24,7 @@ O ecossistema divide-se em motores de infraestrutura em segundo plano e uma inte
   - Otimizado e calibrado para ignorar diretórios de sistema e caches ruidosas (`venv`, `.vscode`, `snap`, `.mozilla`), garantindo execuções limpas em menos de 1 segundo.
 * **🌐 Threat Intelligence e Geo-Blocking (`atualizar_geoblock.sh`):**
   - Configura o IPSet no nível do kernel para descartar pacotes silenciosamente no UFW (`before.rules`).
-  - Descarrega e bloqueia zonas geográficas de alto risco (Rússia e China).
+  - Descarrega e bloqueia zonas geográficas de alto risco.
   - Injeta proativamente a lista negra global da FireHOL (Level 1).
   - **Automação:** Agendado via Crontab para atualização diária às 04h00.
 * **📦 Cofre de Backups Imutáveis (`backup_imutavel.sh`):**
