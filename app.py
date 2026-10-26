@@ -39,6 +39,11 @@ def verificar_servico(nome_servico):
 def ler_log_suricata():
     dados = []
     log_path = "/var/log/suricata/fast.log"
+    
+    # Whitelist passiva: IPs a ocultar do painel visual (não desativa a firewall)
+    ips_ignorados = ["192.168.15.3", "192.168.15.7"] 
+    prefixos_ignorados = ["2001:4860:", "2804:07f0:"] 
+
     if os.path.exists(log_path):
         try:
             resultado = subprocess.run(['sudo', 'tail', '-n', '100', log_path], stdout=subprocess.PIPE, text=True)
@@ -48,6 +53,11 @@ def ler_log_suricata():
                     data_hora = linha.split()[0].split('.')[0]
                     parte_origem = linha.split('->')[0].split()[-1]
                     origem = re.sub(r':\d+$', '', parte_origem).replace('[', '').replace(']', '')
+                    
+                    # Motor do Filtro Visual: Ignora se estiver na lista exata ou tiver prefixo conhecido
+                    if origem in ips_ignorados or any(origem.startswith(prefixo) for prefixo in prefixos_ignorados):
+                        continue
+                        
                     dados.append({
                         "Data/Hora": data_hora,
                         "Origem (IP)": origem,
