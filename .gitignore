@@ -8,3 +8,4 @@ backup/
 nohup.out
 backups/
 ips_alertados.txt
+app_estavel.py.bak

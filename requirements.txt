@@ -4,6 +4,7 @@ attrs==26.1.0
 certifi==2026.7.22
 charset-normalizer==3.5.1
 click==8.5.0
+geoip2
 h11==0.16.0
 httptools==0.8.0
 idna==3.19
