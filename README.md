@@ -1,41 +1,24 @@
-# 🛡️ SOC Local (Centro de Operações de Segurança) - ThinkPad T430
+# 🛡️ SOC Local - T430
 
-Um Centro de Operações de Segurança (SOC) de nível empresarial (*Enterprise-Grade*) desenvolvido especificamente para ambiente local Linux (Ubuntu) no ThinkPad T430. O sistema integra monitorização em tempo real, deteção de intrusão, inteligência de ameaças proativa, auditoria EDR, backups forenses imutáveis e alertas locais.
+Um Centro de Operações de Segurança (SOC) local e interativo desenvolvido em Python com **Streamlit**. Projetado para monitorização em tempo real do tráfego de rede, bloqueios de firewall e acessos web no ambiente Lenovo ThinkPad T430 (Ubuntu).
 
----
+## 🚀 Funcionalidades e Sensores Integrados
+* **Suricata (Tráfego de Rede):** Monitorização de intrusões (IDS/IPS) com análise de IPs via GeoIP2.
+* **Fail2Ban (Prisão UFW):** Controlo e visualização de IPs hostis bloqueados ativamente no firewall.
+* **Nginx (Acessos Web):** Registo de acessos locais e análise de tráfego web/WAF.
+* **EDR Shadow AI:** Módulo de auditoria de sistema executável via interface.
+* **Autenticação 2FA:** Acesso restrito ao painel com palavra-passe e autenticação de dois fatores (TOTP / Google Authenticator).
 
-## 🏗️ Arquitetura e Componentes do Sistema
+## ⚡ Últimas Otimizações e Ajustes (v2.0)
+O painel foi recentemente reestruturado para máxima eficiência e estabilidade:
+* **Performance (Zero CPU Spike):** Implementação de cache em memória (`@st.cache_data` com TTL de 5s) nas funções de leitura de logs. Elimina a sobrecarga no disco e no processador durante as renderizações.
+* **Atualização Assíncrona:** Integração do `streamlit_autorefresh` (intervalo de 5000ms) para leitura em tempo real sem interrupções visuais na interface.
+* **Correções Estruturais:** Declaração global das constantes de dataframes (`COLUNAS_SURICATA`, `COLUNAS_F2B`, `COLUNAS_NGINX`) garantindo a integridade da interface mesmo com ficheiros de log vazios.
+* **Segurança Reforçada (Imutabilidade):** Ficheiros críticos do sistema (`app.py` e `soc_local.env`) configurados com o atributo `chattr +i` no sistema operativo, impedindo modificações não autorizadas.
+* **Git Habilitado:** Repositório alinhado via SSH, com proteção de dados sensíveis (`.env`, `venv/`, `__pycache__`, `*.log`) via `.gitignore`.
 
-O ecossistema divide-se em motores de infraestrutura em segundo plano e uma interface gráfica interativa desenvolvida em **Streamlit**.
-
-### 1. Painel Visual de Controlo e Alertas (`app.py`)
-* **Framework:** Streamlit (Layout em widescreen).
-* **Métricas em Tempo Real:** Monitorização de recursos de hardware (CPU, RAM, Disco) via `psutil`, estado dos sensores operantes e contagem de ameaças ativas.
-* **Geolocalização Offline:** Integração com a base de dados MaxMind GeoLite2 City (`.mmdb`) para mapear a origem geográfica dos IPs maliciosos.
-* **Autenticação Opcional:** Defina a variável de ambiente `SOC_PASSWORD` para exigir senha no painel.
-* **Abas de Análise Forense:**
-  - **Suricata:** Registo de pacotes de rede suspeitos com filtragem avançada de ruído e parsing de IPv4/IPv6.
-  - **Fail2Ban (Prisão UFW):** Monitorização dinâmica dos IPs bloqueados nos jails `suricata`, `sshd` e `nginx-botsearch`.
-  - **Nginx (WAF):** Registo de acessos web, métodos HTTP, rotas e códigos de status para deteção de tentativas de exploração.
-
-### 2. Motores de Defesa e Automação
-* **🛡️ Auditoria EDR (`edr_shadow_ai.sh`):** 
-  - Deteta ferramentas de IA não autorizadas e chaves de API expostas.
-  - Otimizado e calibrado para ignorar diretórios de sistema e caches ruidosas (`venv`, `.vscode`, `snap`, `.mozilla`), garantindo execuções limpas em menos de 1 segundo.
-* **🌐 Threat Intelligence e Geo-Blocking (`atualizar_geoblock.sh`):**
-  - Configura o IPSet no nível do kernel para descartar pacotes silenciosamente no UFW (`before.rules`).
-  - Descarrega e bloqueia zonas geográficas de alto risco.
-  - Injeta proativamente a lista negra global da FireHOL (Level 1).
-  - **Automação:** Agendado via Crontab para atualização diária às 04h00.
-* **📦 Cofre de Backups Imutáveis (`backup_imutavel.sh`):**
-  - Compacta o código-fonte do SOC e os registos vitais (`fast.log`, `access.log`, relatórios EDR) num arquivo seguro `.tar.gz`.
-  - **Blindagem de Segurança:** Aplica o atributo de imutabilidade do Linux (`chattr +i`) ao ficheiro gerado, dificultando a alteração ou remoção por malware sem privilégios de *root*. Nota: um *root* ainda pode executar `chattr -i`; para proteção real contra *ransomware*, mantenha também uma cópia fora da máquina (outro disco, NAS ou nuvem com versionamento).
-
----
-
-## 🔒 Segurança e Imutabilidade
-
-Para evitar que softwares maliciosos ou ataques cibernéticos comprometam a integridade do sistema de defesa, os ficheiros vitais do SOC encontram-se rigorosamente trancados com o comando de imutabilidade do kernel Linux:
-```bash
-sudo chattr +i app.py atualizar_geoblock.sh edr_shadow_ai.sh backup_imutavel.sh
-```
+## 🛠️ Como Executar
+1. Ative o ambiente virtual: `source venv/bin/activate`
+2. Instale as dependências: `pip install -r requirements.txt`
+3. Configure as variáveis de ambiente no ficheiro `.env` (protegido).
+4. Inicie o serviço pelo Systemd ou via terminal:
