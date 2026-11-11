@@ -8,6 +8,7 @@ import stat
 import hmac
 import ipaddress
 import re
+import binascii
 import threading
 import geoip2.database
 import time
@@ -22,14 +23,21 @@ st.set_page_config(page_title="SOC Local - T430", layout="wide")
 # AUTENTICAÇÃO (Senha + 2FA TOTP) - fail-closed
 # ==========================================
 SENHA_PAINEL = os.environ.get("SOC_PASSWORD", "")
-TOTP_SECRET = os.environ.get("SOC_TOTP_SECRET", "")
+TOTP_SECRET = os.environ.get("SOC_TOTP_SECRET", "").strip().upper()
 SEGREDOS_PROIBIDOS = {"JBSWY3DPEHPK3PXP"}
 SESSAO_MAX_SEGUNDOS = 8 * 3600
+ETAPA_SENHA_MAX_SEGUNDOS = 5 * 60
 MAX_FALHAS = 5
 BLOQUEIO_SEGUNDOS = 300
 
-if not SENHA_PAINEL or len(TOTP_SECRET) < 16 or TOTP_SECRET in SEGREDOS_PROIBIDOS:
-    st.error("Autenticação não configurada corretamente. Painel bloqueado.")
+# Falha de forma segura se a senha ou o segredo TOTP não estiverem configurados.
+try:
+    if not SENHA_PAINEL or len(TOTP_SECRET) < 16 or TOTP_SECRET in SEGREDOS_PROIBIDOS:
+        raise ValueError("Credenciais ausentes, curtas ou conhecidamente inseguras.")
+    # Força a decodificação Base32 agora, em vez de descobrir o erro no primeiro login.
+    pyotp.TOTP(TOTP_SECRET).now()
+except (ValueError, TypeError, binascii.Error):
+    st.error("Autenticação não configurada corretamente. Verifique SOC_PASSWORD e SOC_TOTP_SECRET. Painel bloqueado.")
     st.stop()
 
 
@@ -38,17 +46,55 @@ def _estado_login():
     return {
         "lock": threading.Lock(),
         "ips": {},
+        # O segredo TOTP é único para este painel; o passo precisa ser global
+        # para impedir que duas sessões reutilizem o mesmo código.
         "ultimo_passo": 0
     }
 
 
+def _ip_em_redes(endereco, redes):
+    for rede in redes:
+        try:
+            if endereco in ipaddress.ip_network(rede, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _ip_cliente():
     try:
-        ip = st.context.ip_address or ""
+        ip_conexao = str(ipaddress.ip_address(st.context.ip_address or ""))
+        ip = ip_conexao
+
+        # X-Forwarded-For só é confiável quando a conexão veio de um proxy
+        # explicitamente autorizado em SOC_TRUSTED_PROXIES (CIDRs separados por vírgula).
         if os.environ.get("SOC_TRUST_PROXY") == "1":
-            xff = st.context.headers.get("X-Forwarded-For", "")
-            if xff:
-                ip = xff.split(",")[0].strip()
+            proxies_configurados = [
+                item.strip() for item in os.environ.get("SOC_TRUSTED_PROXIES", "").split(",")
+                if item.strip()
+            ]
+            proxy_confiavel = False
+            for rede in proxies_configurados:
+                try:
+                    if ipaddress.ip_address(ip_conexao) in ipaddress.ip_network(rede, strict=False):
+                        proxy_confiavel = True
+                        break
+                except ValueError:
+                    continue
+
+            if proxy_confiavel:
+                xff = st.context.headers.get("X-Forwarded-For", "")
+                if xff:
+                    # Percorre da direita para a esquerda: o primeiro IP que não é
+                    # proxy confiável é o cliente. A entrada mais à esquerda é
+                    # controlada pelo próprio cliente e pode ser forjada.
+                    for item in reversed([x.strip() for x in xff.split(",")]):
+                        endereco_xff = ipaddress.ip_address(item)
+                        ip = str(endereco_xff)
+                        if not _ip_em_redes(endereco_xff, proxies_configurados):
+                            break
+
         return str(ipaddress.ip_address(ip))
     except Exception:
         return "desconhecido"
@@ -61,29 +107,48 @@ def _log_auth(msg):
 
 def _checar_bloqueio_ip(ip):
     estado = _estado_login()
+    agora = time.time()
     with estado["lock"]:
-        dados_ip = estado["ips"].get(ip, {"falhas": 0, "bloqueado_ate": 0.0})
-        return time.time() < dados_ip["bloqueado_ate"]
+        dados_ip = estado["ips"].get(ip)
+        return bool(dados_ip and agora < dados_ip.get("bloqueado_ate", 0.0))
 
 
 def _registrar_falha(motivo):
     ip = _ip_cliente()
+    agora = time.time()
     estado = _estado_login()
     with estado["lock"]:
-        if len(estado["ips"]) > 1000:
-            agora = time.time()
-            estado["ips"] = {k: v for k, v in estado["ips"].items() if agora < v["bloqueado_ate"]}
-            if len(estado["ips"]) > 1000:
-                estado["ips"].clear()
-        dados_ip = estado["ips"].setdefault(ip, {"falhas": 0, "bloqueado_ate": 0.0})
+        # Remove registros antigos sem apagar bloqueios ainda vigentes.
+        estado["ips"] = {
+            chave: valor for chave, valor in estado["ips"].items()
+            if agora - valor.get("ultima_atividade", agora) < 86400
+            or agora < valor.get("bloqueado_ate", 0.0)
+        }
+
+        # Limita o crescimento do dicionário sem limpar bloqueios ativos.
+        if len(estado["ips"]) >= 5000:
+            candidatos = [
+                (chave, valor.get("ultima_atividade", 0.0))
+                for chave, valor in estado["ips"].items()
+                if agora >= valor.get("bloqueado_ate", 0.0) and chave != ip
+            ]
+            for chave, _ in sorted(candidatos, key=lambda item: item[1])[:max(1, len(estado["ips"]) - 4000)]:
+                estado["ips"].pop(chave, None)
+
+        dados_ip = estado["ips"].setdefault(
+            ip, {"falhas": 0, "bloqueado_ate": 0.0, "ultima_atividade": agora}
+        )
+        dados_ip["ultima_atividade"] = agora
         dados_ip["falhas"] += 1
         tentativas = dados_ip["falhas"]
+
         if tentativas >= MAX_FALHAS:
-            dados_ip["bloqueado_ate"] = time.time() + BLOQUEIO_SEGUNDOS
+            dados_ip["bloqueado_ate"] = agora + BLOQUEIO_SEGUNDOS
             dados_ip["falhas"] = 0
             bloqueado = True
         else:
             bloqueado = False
+
     _log_auth(f"falha de login ({motivo}); tentativas={tentativas}")
     if bloqueado:
         _log_auth(f"login bloqueado por {BLOQUEIO_SEGUNDOS}s")
@@ -97,15 +162,21 @@ def _limpar_falhas_ip():
 
 
 def _verificar_totp(codigo):
-    if not (codigo.isdigit() and len(codigo) == 6):
+    codigo = str(codigo or "").strip()
+    if not (codigo.isascii() and codigo.isdigit() and len(codigo) == 6):
         return False
+
     totp = pyotp.TOTP(TOTP_SECRET)
     agora = time.time()
     passo_atual = int(agora // totp.interval)
     estado = _estado_login()
+
+    # A validação e a atualização do passo são atômicas. Como o painel usa
+    # um único segredo TOTP, a proteção contra replay deve ser compartilhada.
     with estado["lock"]:
         for desloc in (-1, 0, 1):
-            if hmac.compare_digest(totp.at(agora, desloc), codigo):
+            codigo_esperado = totp.at(agora, desloc)
+            if hmac.compare_digest(codigo_esperado, codigo):
                 passo = passo_atual + desloc
                 if passo <= estado["ultimo_passo"]:
                     return False
@@ -114,10 +185,20 @@ def _verificar_totp(codigo):
     return False
 
 
-if st.session_state.get("autenticado") and \
-        time.time() - st.session_state.get("auth_ts", 0) > SESSAO_MAX_SEGUNDOS:
+# Expira tanto a sessão autenticada quanto a etapa intermediária da senha.
+agora_login = time.time()
+if st.session_state.get("autenticado") and (
+    agora_login - st.session_state.get("auth_ts", 0) > SESSAO_MAX_SEGUNDOS
+):
     st.session_state.clear()
     st.warning("Sessão expirada. Autentique-se novamente.")
+
+if st.session_state.get("senha_ok") and (
+    agora_login - st.session_state.get("senha_ts", 0) > ETAPA_SENHA_MAX_SEGUNDOS
+):
+    st.session_state.pop("senha_ok", None)
+    st.session_state.pop("senha_ts", None)
+    st.warning("Etapa de autenticação expirada. Informe a senha novamente.")
 
 if not st.session_state.get("autenticado"):
     if _checar_bloqueio_ip(_ip_cliente()):
@@ -129,6 +210,7 @@ if not st.session_state.get("autenticado"):
         if senha:
             if hmac.compare_digest(senha.encode("utf-8"), SENHA_PAINEL.encode("utf-8")):
                 st.session_state["senha_ok"] = True
+                st.session_state["senha_ts"] = time.time()
                 st.rerun()
             else:
                 _registrar_falha("senha")
@@ -142,12 +224,20 @@ if not st.session_state.get("autenticado"):
             st.session_state["autenticado"] = True
             st.session_state["auth_ts"] = time.time()
             st.session_state.pop("senha_ok", None)
+            st.session_state.pop("senha_ts", None)
             _log_auth("login bem-sucedido")
             st.rerun()
         else:
             _registrar_falha("totp")
             st.error("Credenciais inválidas.")
     st.stop()
+
+def _revalidar_sessao():
+    # Fragments com run_every não reexecutam o script inteiro; sem esta checagem
+    # a expiração de sessão nunca vale para uma aba deixada aberta.
+    if time.time() - st.session_state.get("auth_ts", 0) > SESSAO_MAX_SEGUNDOS:
+        st.rerun(scope="app")
+
 
 # ==========================================
 # CONSTANTES E CAMINHOS ABSOLUTOS
@@ -172,39 +262,88 @@ RUIDO_SURICATA = (
     "Packet with invalid timestamp",
     "excessive retransmissions",
     "SYNACK resend with different seq",
-    "SURICATA STREAM"
+    "SURICATA STREAM",
+    "GNU/Linux APT User-Agent Outbound"
 )
 
 
 def _sanitizar_celula(texto, max_len=220):
-    if not texto:
+    if texto is None:
         return ""
     limpo = CHARS_CONTROLE.sub(" ", str(texto)).strip()
     return limpo[:max_len] + ("…" if len(limpo) > max_len else "")
 
 
+def _sanitizar_relatorio(texto, max_len=8000):
+    # Preserva quebras de linha do relatório, removendo controles e sequências
+    # que possam interferir na apresentação do conteúdo.
+    if texto is None:
+        return ""
+    texto = str(texto).replace("\r\n", "\n").replace("\r", "\n")
+    texto = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", texto)
+    texto = texto.strip()
+    return texto[:max_len] + ("\n… [relatório truncado]" if len(texto) > max_len else "")
+
+
 def _arquivo_seguro_root(caminho):
     try:
-        st_info = os.lstat(caminho)
-        if stat.S_ISLNK(st_info.st_mode) or not stat.S_ISREG(st_info.st_mode):
-            return False, "Arquivo é um link simbólico ou não é arquivo regular."
-        if st_info.st_uid != 0:
+        caminho = os.path.abspath(caminho)
+        info_arquivo = os.lstat(caminho)
+
+        if stat.S_ISLNK(info_arquivo.st_mode) or not stat.S_ISREG(info_arquivo.st_mode):
+            return False, "O caminho não aponta para um arquivo regular sem link simbólico."
+        if info_arquivo.st_uid != 0:
             return False, "Arquivo não pertence ao root (UID != 0)."
-        if st_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        if info_arquivo.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             return False, "Permissões inseguras: grupo ou outros têm permissão de escrita."
+        if not info_arquivo.st_mode & stat.S_IXUSR:
+            return False, "O arquivo não possui permissão de execução para o proprietário."
+
+        # Também protege contra substituição do script por meio de diretório pai gravável.
+        diretorio = os.path.dirname(caminho)
+        while True:
+            info_dir = os.lstat(diretorio)
+            if stat.S_ISLNK(info_dir.st_mode) or not stat.S_ISDIR(info_dir.st_mode):
+                return False, f"Diretório pai inseguro: {diretorio}"
+            if info_dir.st_uid != 0:
+                return False, f"Diretório pai não pertence ao root: {diretorio}"
+            if info_dir.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return False, f"Diretório pai permite escrita por grupo/outros: {diretorio}"
+            pai = os.path.dirname(diretorio)
+            if pai == diretorio:
+                break
+            diretorio = pai
+
         return True, "OK"
     except Exception as e:
-        return False, str(e)
+        return False, _sanitizar_celula(e, 180)
+
+
+def _validar_argv(comando):
+    # Todos os comandos deste painel são listas fixas; não permitir shell ou
+    # argumentos construídos como uma string única.
+    if not isinstance(comando, (list, tuple)) or not comando:
+        raise ValueError("Comando inválido: esperado uma lista de argumentos.")
+    if not all(isinstance(arg, str) and arg and "\x00" not in arg for arg in comando):
+        raise ValueError("Comando inválido: argumentos devem ser textos não vazios.")
+    return list(comando)
 
 
 def executar(comando, timeout=5):
     try:
         resultado = subprocess.run(
-            comando, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, timeout=timeout, check=False
+            _validar_argv(comando),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            close_fds=True
         )
         return resultado.stdout
-    except Exception:
+    except (OSError, subprocess.SubprocessError, ValueError):
         return ""
 
 
@@ -280,37 +419,58 @@ def _limpar_ip_porta(texto):
     return _sanitizar_celula(texto, 45)
 
 
+def _ips_desta_maquina():
+    # IPs atuais das interfaces (sem loopback). O IP muda com DHCP, e um valor fixo
+    # no código acabaria escondendo o host errado.
+    ips = set()
+    try:
+        for enderecos in psutil.net_if_addrs().values():
+            for e in enderecos:
+                try:
+                    ip = ipaddress.ip_address(e.address.split('%')[0])
+                except ValueError:
+                    continue
+                if not ip.is_loopback and not ip.is_link_local:
+                    ips.add(str(ip))
+    except Exception:
+        pass
+    return ips
+
+
 @st.cache_data(ttl=5)
 def ler_log_suricata(ocultar_ruido=True, ocultar_ip_proprio=True):
     dados = []
     ips_ignorados = {"192.168.15.3"}
     if ocultar_ip_proprio:
-        ips_ignorados.add("192.168.15.8")
+        ips_ignorados.update(_ips_desta_maquina())
     try:
-        linhas = _ultimas_linhas(LOG_SURICATA, 1500)
-        for linha in reversed(linhas):
+        linhas = _ultimas_linhas(LOG_SURICATA, 20000, max_bytes=16 * 1024 * 1024)
+        for idx, linha in enumerate(reversed(linhas)):
             if not linha or '->' not in linha:
+                continue
+            # Só as 1500 linhas mais recentes são processadas por inteiro; mais atrás,
+            # apenas prioridade 1-2. Resiste a flood de ruído sem custar CPU toda hora.
+            if idx >= 1500 and '[Priority: 1]' not in linha and '[Priority: 2]' not in linha:
                 continue
             try:
                 partes_seta = linha.split('->')
                 data_hora = _sanitizar_celula(partes_seta[0].split()[0].split('.')[0], 30)
                 origem = _limpar_ip_porta(partes_seta[0].split()[-1])
                 destino = _limpar_ip_porta(partes_seta[1].split()[0])
-                if origem in ips_ignorados:
-                    continue
                 m = re.search(r'\[\*\*\]\s*\[[\d:]+\]\s*(.*?)\s*\[\*\*\]', linha)
                 descricao = _sanitizar_celula(m.group(1) if m else "Atividade suspeita detetada.", 180)
                 p = re.search(r'\[Priority:\s*(\d+)\]', linha)
                 prioridade = int(p.group(1)) if p else 3
-                if ocultar_ruido and any(r in descricao for r in RUIDO_SURICATA):
+                # Alertas de prioridade 1-2 nunca são ocultados (nem por IP, nem por "ruído").
+                if prioridade > 2 and origem in ips_ignorados:
                     continue
-                loc_origem = obter_localizacao(origem)
-                loc_exibida = obter_localizacao(destino) if loc_origem == "Rede Local" else loc_origem
+                if prioridade > 2 and ocultar_ruido and any(r in descricao for r in RUIDO_SURICATA):
+                    continue
                 dados.append({
                     "Data/Hora": data_hora,
                     "Origem (IP)": origem,
                     "Destino (IP)": destino,
-                    "Localização Externa": loc_exibida,
+                    "Localização Externa": "",
                     "O que ocorreu?": descricao,
                     "Prioridade": prioridade,
                     "Medida": "🚨 Investigar" if prioridade <= 2 else "⚠️ Monitorizando"
@@ -323,7 +483,13 @@ def ler_log_suricata(ocultar_ruido=True, ocultar_ip_proprio=True):
         return pd.DataFrame(columns=COLUNAS_SURICATA)
     df = pd.DataFrame(dados)
     df = df.drop_duplicates(subset=["Data/Hora", "Origem (IP)", "Destino (IP)", "O que ocorreu?"])
-    return df.sort_values("Prioridade", kind="stable").head(300)
+    df = df.sort_values("Prioridade", kind="stable").head(300).copy()
+    locs = []
+    for o, d in zip(df["Origem (IP)"], df["Destino (IP)"]):
+        loc_o = obter_localizacao(o)
+        locs.append(obter_localizacao(d) if loc_o == "Rede Local" else loc_o)
+    df["Localização Externa"] = locs
+    return df
 
 
 @st.cache_data(ttl=5)
@@ -389,10 +555,20 @@ SERVICOS_EXTRA = ["fail2ban", "suricata", "nginx", "ssh", "ufw", "endlessh"]
 
 def _cmd(comando, timeout=5):
     try:
-        r = subprocess.run(comando, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
+        r = subprocess.run(
+            _validar_argv(comando),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            close_fds=True
+        )
         return r.returncode, r.stdout, r.stderr
-    except Exception as e:
-        return 127, "", str(e)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return 127, "", _sanitizar_celula(e, 180)
 
 
 def _idade(seg):
@@ -469,6 +645,7 @@ def fontes_de_log():
 with st.sidebar:
     @st.fragment(run_every=10)
     def _painel_lateral_dinamico():
+        _revalidar_sessao()
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory().percent
         disco = psutil.disk_usage('/').percent
@@ -502,6 +679,7 @@ st.markdown("---")
 
 @st.fragment(run_every=10)
 def _secao_monitoramento_ao_vivo():
+    _revalidar_sessao()
     ocultar_ruido_padrao = st.session_state.get("ocultar_ruido_suricata", True)
     ocultar_proprio_padrao = st.session_state.get("ocultar_ip_proprio_suricata", True)
 
@@ -515,8 +693,14 @@ def _secao_monitoramento_ao_vivo():
     servicos = {"Fail2Ban": "fail2ban", "SSH": "ssh", "Nginx": "nginx", "Suricata": "suricata"}
     sensores_ativos = sum(int(verificar_servico(s)) for s in servicos.values())
 
+    df_fontes = fontes_de_log()
+    n_ruins = int(df_fontes["Status"].str.startswith("🔴").sum())
+
     if alertas_recentes(df_suricata, 60) > 0:
         estado_perimetro = "Sob Ataque"
+    elif sensores_ativos < len(servicos) or n_ruins:
+        # Cego não é seguro: sensor parado ou fonte ilegível invalida o "Seguro".
+        estado_perimetro = "Degradado"
     elif total_bloqueados > 0:
         estado_perimetro = "Bloqueios Ativos"
     else:
@@ -545,13 +729,13 @@ def _secao_monitoramento_ao_vivo():
         c_f1, c_f2 = st.columns(2)
         with c_f1:
             st.checkbox(
-                "Ocultar ruído de rede (STUN / Checksum UDPv6 / Retransmissões)",
+                "Ocultar ruído de rede (STUN / Checksum UDPv6 / Retransmissões / APT)",
                 value=True,
                 key="ocultar_ruido_suricata"
             )
         with c_f2:
             st.checkbox(
-                "Ocultar tráfego de saída gerado por esta máquina (192.168.15.8)",
+                f"Ocultar tráfego de saída gerado por esta máquina ({', '.join(sorted(_ips_desta_maquina())) or 'IP não detectado'})",
                 value=True,
                 key="ocultar_ip_proprio_suricata"
             )
@@ -570,8 +754,6 @@ def _secao_monitoramento_ao_vivo():
 
     with aba_saude:
         st.caption("Cada linha mostra se o painel CONSEGUE ler a fonte agora (com o usuário e as permissões do serviço).")
-        df_fontes = fontes_de_log()
-        n_ruins = int(df_fontes["Status"].str.startswith("🔴").sum())
         if n_ruins:
             st.error(f"⚠️ {n_ruins} fonte(s) com problema de leitura/serviço. Dados dessas fontes NÃO estão chegando ao painel.")
         else:
@@ -595,8 +777,14 @@ if st.button("Executar Varredura EDR Agora", key="btn_edr_scan"):
                 raise RuntimeError(f"Script EDR rejeitado por segurança: {motivo_edr}")
             r = subprocess.run(
                 ['/usr/bin/sudo', '-n', SCRIPT_EDR],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=60, check=False
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                timeout=60,
+                check=False,
+                close_fds=True
             )
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.strip() or f"Código de saída {r.returncode}")
@@ -614,4 +802,4 @@ except Exception:
     relatorio_edr = ""
 
 if relatorio_edr:
-    st.text_area("Último Relatório:", value=_sanitizar_celula(relatorio_edr, 8000), height=150, disabled=True)
+    st.text_area("Último Relatório:", value=_sanitizar_relatorio(relatorio_edr, 8000), height=150, disabled=True)
