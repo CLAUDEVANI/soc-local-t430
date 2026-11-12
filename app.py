@@ -13,6 +13,7 @@ import threading
 import geoip2.database
 import time
 import pyotp
+import json
 
 # ==========================================
 # CONFIGURAÇÕES DA PÁGINA
@@ -248,6 +249,7 @@ LOG_SURICATA = "/var/log/suricata/fast.log"
 LOG_NGINX = "/var/log/nginx/access.log"
 SCRIPT_EDR = "/opt/soc_local/edr_shadow_ai.sh"
 LOG_EDR = "/var/log/shadow_ai_edr.log"
+JSON_NMAP = "/opt/soc_local/nmap_inventory.json"
 
 COLUNAS_SURICATA = ["Data/Hora", "Origem (IP)", "Destino (IP)", "Localização Externa", "O que ocorreu?", "Prioridade", "Medida"]
 COLUNAS_F2B = ["Origem (IP)", "Localização", "Estado", "Prisão"]
@@ -275,8 +277,6 @@ def _sanitizar_celula(texto, max_len=220):
 
 
 def _sanitizar_relatorio(texto, max_len=8000):
-    # Preserva quebras de linha do relatório, removendo controles e sequências
-    # que possam interferir na apresentação do conteúdo.
     if texto is None:
         return ""
     texto = str(texto).replace("\r\n", "\n").replace("\r", "\n")
@@ -299,7 +299,6 @@ def _arquivo_seguro_root(caminho):
         if not info_arquivo.st_mode & stat.S_IXUSR:
             return False, "O arquivo não possui permissão de execução para o proprietário."
 
-        # Também protege contra substituição do script por meio de diretório pai gravável.
         diretorio = os.path.dirname(caminho)
         while True:
             info_dir = os.lstat(diretorio)
@@ -320,8 +319,6 @@ def _arquivo_seguro_root(caminho):
 
 
 def _validar_argv(comando):
-    # Todos os comandos deste painel são listas fixas; não permitir shell ou
-    # argumentos construídos como uma string única.
     if not isinstance(comando, (list, tuple)) or not comando:
         raise ValueError("Comando inválido: esperado uma lista de argumentos.")
     if not all(isinstance(arg, str) and arg and "\x00" not in arg for arg in comando):
@@ -420,8 +417,6 @@ def _limpar_ip_porta(texto):
 
 
 def _ips_desta_maquina():
-    # IPs atuais das interfaces (sem loopback). O IP muda com DHCP, e um valor fixo
-    # no código acabaria escondendo o host errado.
     ips = set()
     try:
         for enderecos in psutil.net_if_addrs().values():
@@ -448,8 +443,6 @@ def ler_log_suricata(ocultar_ruido=True, ocultar_ip_proprio=True):
         for idx, linha in enumerate(reversed(linhas)):
             if not linha or '->' not in linha:
                 continue
-            # Só as 1500 linhas mais recentes são processadas por inteiro; mais atrás,
-            # apenas prioridade 1-2. Resiste a flood de ruído sem custar CPU toda hora.
             if idx >= 1500 and '[Priority: 1]' not in linha and '[Priority: 2]' not in linha:
                 continue
             try:
@@ -461,7 +454,6 @@ def ler_log_suricata(ocultar_ruido=True, ocultar_ip_proprio=True):
                 descricao = _sanitizar_celula(m.group(1) if m else "Atividade suspeita detetada.", 180)
                 p = re.search(r'\[Priority:\s*(\d+)\]', linha)
                 prioridade = int(p.group(1)) if p else 3
-                # Alertas de prioridade 1-2 nunca são ocultados (nem por IP, nem por "ruído").
                 if prioridade > 2 and origem in ips_ignorados:
                     continue
                 if prioridade > 2 and ocultar_ruido and any(r in descricao for r in RUIDO_SURICATA):
@@ -538,6 +530,17 @@ def ler_log_nginx():
             "Status": _sanitizar_celula(status or "200", 6)
         })
     return pd.DataFrame(dados) if dados else pd.DataFrame(columns=COLUNAS_NGINX)
+
+
+@st.cache_data(ttl=60)
+def ler_inventario_nmap():
+    try:
+        if os.path.exists(JSON_NMAP):
+            with open(JSON_NMAP, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"timestamp": "", "lan_hosts": [], "self_ports": []}
 
 
 FONTES_LOG = [
@@ -699,7 +702,6 @@ def _secao_monitoramento_ao_vivo():
     if alertas_recentes(df_suricata, 60) > 0:
         estado_perimetro = "Sob Ataque"
     elif sensores_ativos < len(servicos) or n_ruins:
-        # Cego não é seguro: sensor parado ou fonte ilegível invalida o "Seguro".
         estado_perimetro = "Degradado"
     elif total_bloqueados > 0:
         estado_perimetro = "Bloqueios Ativos"
@@ -718,10 +720,11 @@ def _secao_monitoramento_ao_vivo():
 
     st.markdown("---")
 
-    aba_suricata, aba_fail2ban, aba_nginx, aba_saude = st.tabs([
+    aba_suricata, aba_fail2ban, aba_nginx, aba_rede, aba_saude = st.tabs([
         "Suricata (Tráfego de Rede)",
         "Fail2Ban (Prisão UFW)",
         "Nginx (Acessos Web WAF)",
+        "Rede (Nmap)",
         "Saúde do Sistema"
     ])
 
@@ -751,6 +754,28 @@ def _secao_monitoramento_ao_vivo():
     with aba_nginx:
         st.caption("Registo das últimas tentativas de acesso ao seu servidor Web local.")
         st.dataframe(df_nginx, width="stretch", hide_index=True)
+
+    with aba_rede:
+        nmap_data = ler_inventario_nmap()
+        st.caption(f"Última varredura Nmap: {nmap_data.get('timestamp', 'Desconhecido')}")
+        
+        st.markdown("### 🌐 Dispositivos na LAN (192.168.15.0/24)")
+        lan_hosts = nmap_data.get("lan_hosts", [])
+        if lan_hosts:
+            df_lan = pd.DataFrame(lan_hosts)
+            df_lan.columns = ["IP", "MAC", "Fabricante"]
+            st.dataframe(df_lan, width="stretch", hide_index=True)
+        else:
+            st.info("Nenhum host descoberto na última varredura ou aguardando execução do timer.")
+
+        st.markdown("### 🔒 Portas e Firewall do T430 (127.0.0.1)")
+        self_ports = nmap_data.get("self_ports", [])
+        if self_ports:
+            df_self = pd.DataFrame(self_ports)
+            df_self.columns = ["Porta", "Estado", "Serviço"]
+            st.dataframe(df_self, width="stretch", hide_index=True)
+        else:
+            st.info("Nenhum dado de porta local registrado.")
 
     with aba_saude:
         st.caption("Cada linha mostra se o painel CONSEGUE ler a fonte agora (com o usuário e as permissões do serviço).")
